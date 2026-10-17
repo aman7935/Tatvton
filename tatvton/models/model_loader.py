@@ -48,8 +48,15 @@ class ModelLoader:
             self._components["sam"] = predictor
         return self._components["sam"]
 
+    @property
+    def has_controlnet(self) -> bool:
+        """Whether a ControlNet is configured."""
+        return self._config.controlnet_model_id is not None
+
     def load_controlnet(self) -> Any:
-        """Load and return the ControlNet model."""
+        """Load and return the ControlNet model (requires ``controlnet_model_id``)."""
+        if self._config.controlnet_model_id is None:
+            raise ValueError("No controlnet_model_id configured.")
         if "controlnet" not in self._components:
             logger.info(
                 "Loading ControlNet from %s", self._config.controlnet_model_id
@@ -64,37 +71,51 @@ class ModelLoader:
         return self._components["controlnet"]
 
     def load_inpainting_pipeline(self) -> Any:
-        """Load and return the SDXL + ControlNet inpainting pipeline.
+        """Load and return the SDXL inpainting pipeline.
 
-        This also configures IP-Adapter and applies the chosen offload strategy.
+        Uses the ControlNet variant when ``controlnet_model_id`` is set, and
+        configures IP-Adapter and the chosen offload strategy.
         """
         if "pipeline" not in self._components:
-            controlnet = self.load_controlnet()
+            cfg = self._config
+            kwargs: dict[str, Any] = {"torch_dtype": self._dtype}
+            if self._dtype == torch.float16:
+                kwargs["variant"] = "fp16"
+            if cfg.vae_model_id is not None:
+                from diffusers import AutoencoderKL
 
-            logger.info(
-                "Loading SDXL inpainting pipeline from %s",
-                self._config.sdxl_model_id,
-            )
-            from diffusers import StableDiffusionXLControlNetInpaintPipeline
+                logger.info("Loading VAE from %s", cfg.vae_model_id)
+                kwargs["vae"] = AutoencoderKL.from_pretrained(
+                    cfg.vae_model_id, torch_dtype=self._dtype
+                )
 
-            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
-                self._config.sdxl_model_id,
-                controlnet=controlnet,
-                torch_dtype=self._dtype,
-                variant="fp16" if self._dtype == torch.float16 else None,
-            )
+            logger.info("Loading SDXL inpainting pipeline from %s", cfg.sdxl_model_id)
+            if self.has_controlnet:
+                from diffusers import StableDiffusionXLControlNetInpaintPipeline
 
-            logger.info(
-                "Loading IP-Adapter: %s / %s",
-                self._config.ip_adapter_repo_id,
-                self._config.ip_adapter_weight_name,
-            )
-            pipe.load_ip_adapter(
-                self._config.ip_adapter_repo_id,
-                subfolder="sdxl_models",
-                weight_name=self._config.ip_adapter_weight_name,
-            )
-            pipe.set_ip_adapter_scale(self._config.ip_adapter_scale)
+                pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+                    cfg.sdxl_model_id, controlnet=self.load_controlnet(), **kwargs
+                )
+            else:
+                from diffusers import StableDiffusionXLInpaintPipeline
+
+                pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+                    cfg.sdxl_model_id, **kwargs
+                )
+
+            if cfg.use_ip_adapter:
+                logger.info(
+                    "Loading IP-Adapter: %s / %s",
+                    cfg.ip_adapter_repo_id,
+                    cfg.ip_adapter_weight_name,
+                )
+                pipe.load_ip_adapter(
+                    cfg.ip_adapter_repo_id,
+                    subfolder=cfg.ip_adapter_subfolder,
+                    weight_name=cfg.ip_adapter_weight_name,
+                    image_encoder_folder=cfg.ip_adapter_image_encoder_folder,
+                )
+                pipe.set_ip_adapter_scale(cfg.ip_adapter_scale)
 
             self._apply_offload(pipe)
             self._components["pipeline"] = pipe
@@ -119,7 +140,10 @@ class ModelLoader:
     def _apply_offload(self, pipe: Any) -> None:
         """Apply the configured offload strategy to the diffusion pipeline."""
         strategy = self._config.offload_strategy
-        if strategy == "sequential":
+        if self._device.type != "cuda":
+            # CPU offload hooks need a GPU to offload to
+            pipe.to(self._device)
+        elif strategy == "sequential":
             pipe.enable_sequential_cpu_offload()
             logger.info("Enabled sequential CPU offload")
         elif strategy == "model":

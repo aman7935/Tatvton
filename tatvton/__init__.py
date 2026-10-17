@@ -2,12 +2,13 @@
 
 Public API::
 
-    from tatvton import TatVTONPipeline, TatVTONConfig
+    from tatvton import TatVTONPipeline, TatVTONPreviewPipeline, TatVTONConfig
     from tatvton import PointPrompt, BBoxPrompt, PipelineOutput, MaskResult
 """
 
 from tatvton._version import __version__
 from tatvton.config import TatVTONConfig
+from tatvton.pipeline.preview_pipeline import TatVTONPreviewPipeline
 from tatvton.pipeline.tatvton_pipeline import TatVTONPipeline
 from tatvton.types import (
     BBoxPrompt,
@@ -25,5 +26,6 @@ __all__ = [
     "RegionPrompt",
     "TatVTONConfig",
     "TatVTONPipeline",
+    "TatVTONPreviewPipeline",
     "__version__",
 ]

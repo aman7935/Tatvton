@@ -4,30 +4,33 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import torch
 from PIL import Image
 
 from tatvton.config import TatVTONConfig
 from tatvton.models.model_loader import ModelLoader
 from tatvton.pipeline.inpainting_engine import InpaintingEngine
+from tatvton.pipeline.preview_pipeline import TatVTONPreviewPipeline
 from tatvton.postprocessing.compositing import Compositor
+from tatvton.postprocessing.ink_blend import design_to_rgba
 from tatvton.preprocessing.input_validator import InputValidator
 from tatvton.preprocessing.skin_mask_extractor import SkinMaskExtractor
 from tatvton.types import PipelineOutput, RegionPrompt
-from tatvton.utils.image import resize_for_pipeline
 from tatvton.utils.mask import dilate_mask, mask_to_pil
 
 logger = logging.getLogger(__name__)
 
-_CLIP_IMAGE_SIZE = 224
-
 
 class TatVTONPipeline:
-    """End-to-end tattoo virtual try-on pipeline.
+    """End-to-end photorealistic tattoo virtual try-on ("composite, then refine").
 
-    Orchestrates preprocessing (SAM mask extraction), diffusion-based
-    inpainting (SDXL + ControlNet + IP-Adapter), and post-processing
-    (alpha-blended compositing).
+    1. SAM 2 extracts the skin region at the prompt.
+    2. The design is placed exactly on the skin (same as the CPU preview).
+    3. SDXL inpainting repaints only the tattoo area at low strength, guided
+       by IP-Adapter (the design) and optionally a ControlNet, so the ink
+       looks settled into the skin while the design itself is kept.
+    4. The refined area is feather-blended back into the original photo.
 
     Usage::
 
@@ -46,6 +49,7 @@ class TatVTONPipeline:
         self._config = config or TatVTONConfig()
         self._model_loader = ModelLoader(self._config)
         self._inpainting_engine = InpaintingEngine(self._config, self._model_loader)
+        self._placer = TatVTONPreviewPipeline(self._config)
         self._compositor = Compositor(
             dilation_pixels=self._config.mask_dilation_pixels,
             feather_sigma=self._config.mask_feather_sigma,
@@ -62,10 +66,10 @@ class TatVTONPipeline:
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ) -> TatVTONPipeline:
-        """Create a pipeline from a HF Hub repository.
+        """Create a pipeline that uses the ControlNet in a HF Hub repository.
 
         Args:
-            repo_id: Hub repo containing TatVTON-specific model config.
+            repo_id: Hub repo containing a ControlNet checkpoint.
             device: Target device.
             dtype: Model precision.
 
@@ -79,6 +83,15 @@ class TatVTONPipeline:
         )
         return TatVTONPipeline(config)
 
+    def extract_mask(self, body_image: Image.Image, region: RegionPrompt) -> np.ndarray:
+        """Return the SAM 2 skin mask for *region*, then unload SAM to free VRAM."""
+        extractor = SkinMaskExtractor(self._model_loader.load_sam_predictor())
+        mask_result = extractor.extract(body_image.convert("RGB"), region)
+        logger.info("Mask extracted (score=%.3f)", mask_result.score)
+        extractor.unload()
+        self._model_loader.unload_component("sam")
+        return mask_result.mask
+
     def __call__(
         self,
         body_image: Image.Image,
@@ -90,21 +103,32 @@ class TatVTONPipeline:
         num_inference_steps: int | None = None,
         seed: int | None = None,
         prompt: str | None = None,
+        scale: float = 0.8,
+        rotation: float = 0.0,
+        auto_rotate: bool = True,
+        opacity: float = 0.9,
+        mask: np.ndarray | None = None,
     ) -> PipelineOutput:
         """Run the full tattoo virtual try-on pipeline.
 
         Args:
-            body_image: Body photo (any resolution, RGB).
-            tattoo_image: Tattoo design (any resolution, RGB or RGBA).
+            body_image: Body photo (any resolution, RGB or RGBA).
+            tattoo_image: Tattoo design (plain or transparent background).
             region: :class:`PointPrompt` or :class:`BBoxPrompt` for placement.
-            strength: Denoising strength (per-call override).
+            strength: Refinement strength; higher = more AI change, less fidelity.
             ip_adapter_scale: IP-Adapter influence (per-call override).
             num_inference_steps: Denoising steps (per-call override).
             seed: Random seed (per-call override).
             prompt: Optional text prompt.
+            scale: Design width as a fraction of the limb width.
+            rotation: Extra counter-clockwise rotation in degrees.
+            auto_rotate: Align the design with the limb's long axis.
+            opacity: Ink opacity of the placed design.
+            mask: Precomputed skin mask; skips SAM when given.
 
         Returns:
-            :class:`PipelineOutput` with composited image and metadata.
+            :class:`PipelineOutput`; ``metadata["preview"]`` holds the placed
+            design before AI refinement.
         """
         cfg = self._config
 
@@ -115,85 +139,83 @@ class TatVTONPipeline:
 
         _seed = seed if seed is not None else cfg.seed
         if _seed is None:
-            _seed = torch.randint(0, 2**32, (1,)).item()
+            _seed = int(torch.randint(0, 2**32, (1,)).item())
 
-        # --- Phase 1: Preprocessing (SAM mask extraction) ---
-        logger.info("Phase 1: Extracting skin mask with SAM")
-        sam_predictor = self._model_loader.load_sam_predictor()
-        extractor = SkinMaskExtractor(sam_predictor)
-        mask_result = extractor.extract(body_image, region)
-        logger.info("Mask extracted (score=%.3f)", mask_result.score)
+        body = body_image.convert("RGB")
 
-        # Unload SAM to free VRAM
-        extractor.unload()
-        self._model_loader.unload_component("sam")
+        # --- Phase 1: Skin mask (SAM 2) ---
+        if mask is None:
+            logger.info("Phase 1: Extracting skin mask with SAM")
+            mask = self.extract_mask(body, region)
 
-        # --- Phase 1b: DensePose (optional) ---
-        if cfg.use_densepose:
-            logger.info("Phase 1b: Extracting DensePose UV map")
-            from tatvton.preprocessing.densepose_extractor import DensePoseExtractor
-
-            dp = DensePoseExtractor(
-                config_path="",  # TODO: make configurable
-                weights_url="",
-                device=cfg.device,
-            )
-            control_image = dp.extract(body_image)
-            dp.unload()
-        else:
-            control_image = body_image.convert("RGB")
-
-        # --- Phase 2: Resize to pipeline resolution ---
-        logger.info("Phase 2: Resizing to %d", cfg.resolution)
-        original_size = body_image.size
-        body_resized = resize_for_pipeline(body_image, cfg.resolution)
-        mask_dilated = dilate_mask(mask_result.mask, cfg.mask_dilation_pixels)
-
-        mask_pil = mask_to_pil(mask_dilated)
-        mask_resized = resize_for_pipeline(mask_pil, cfg.resolution)
-        control_resized = resize_for_pipeline(control_image, cfg.resolution)
-        tattoo_resized = resize_for_pipeline(
-            tattoo_image.convert("RGB"), _CLIP_IMAGE_SIZE
+        # --- Phase 2: Place the exact design on the skin ---
+        logger.info("Phase 2: Placing design")
+        placed = self._placer(
+            body, tattoo_image, region,
+            scale=scale, rotation=rotation, auto_rotate=auto_rotate,
+            opacity=opacity, mask=mask,
         )
+        ink = np.asarray(placed.raw_inpainted)[:, :, 3] > 12
+        skin = np.asarray(placed.mask) > 127
+        refine_mask = dilate_mask(ink, cfg.mask_dilation_pixels) & dilate_mask(skin, 2)
+        if not refine_mask.any():
+            raise ValueError("The tattoo doesn't overlap the selected skin region.")
 
-        # --- Phase 3: Diffusion inpainting ---
-        logger.info("Phase 3: Running inpainting")
-        raw_inpainted = self._inpainting_engine.generate(
-            image=body_resized,
-            mask_image=mask_resized,
-            control_image=control_resized,
-            tattoo_image=tattoo_resized,
+        # --- Phase 3: ControlNet conditioning (optional) ---
+        control_image = None
+        if self._model_loader.has_controlnet:
+            if cfg.use_densepose:
+                logger.info("Phase 3: Extracting DensePose UV map")
+                from tatvton.preprocessing.densepose_extractor import DensePoseExtractor
+
+                dp = DensePoseExtractor(
+                    config_path="",  # TODO: make configurable
+                    weights_url="",
+                    device=cfg.device,
+                )
+                control_image = dp.extract(body)
+                dp.unload()
+            else:
+                control_image = placed.image
+
+        # --- Phase 4: SDXL refinement of the tattoo area ---
+        logger.info("Phase 4: Refining tattoo with SDXL")
+        design = design_to_rgba(tattoo_image)
+        design_on_white = Image.new("RGB", design.size, "white")
+        design_on_white.paste(design, mask=design.getchannel("A"))
+
+        raw = self._inpainting_engine.generate(
+            image=placed.image,
+            mask_image=mask_to_pil(refine_mask),
+            tattoo_image=design_on_white,
+            control_image=control_image,
             prompt=prompt,
             strength=strength,
             ip_adapter_scale=ip_adapter_scale,
             num_inference_steps=num_inference_steps,
             seed=_seed,
         )
+        if raw.size != body.size:
+            raw = raw.resize(body.size, Image.Resampling.LANCZOS)
 
-        # --- Phase 4: Compositing ---
-        logger.info("Phase 4: Compositing")
-        import numpy as np
-
-        mask_at_pipeline_res = np.asarray(mask_resized) > 127
-        composited = self._compositor.composite(
-            body_resized, raw_inpainted, mask_at_pipeline_res
-        )
-
-        # Resize back to original
-        final_image = composited.resize(original_size, Image.Resampling.LANCZOS)
-        final_mask = mask_pil.resize(original_size, Image.Resampling.NEAREST)
+        # --- Phase 5: Feathered blend back into the photo ---
+        logger.info("Phase 5: Compositing")
+        final = self._compositor.composite(placed.image, raw, refine_mask)
+        if body_image.mode == "RGBA":
+            final.putalpha(body_image.getchannel("A"))
 
         logger.info("Done (seed=%d)", _seed)
-
         return PipelineOutput(
-            image=final_image,
-            mask=final_mask,
-            raw_inpainted=raw_inpainted,
+            image=final,
+            mask=mask_to_pil(refine_mask),
+            raw_inpainted=raw,
             seed=_seed,
+            metadata={**placed.metadata, "mode": "refine", "preview": placed.image},
         )
 
     def unload(self) -> None:
         """Release all loaded models and free GPU memory."""
         self._inpainting_engine.unload()
         self._model_loader.unload_all()
+        self._placer.unload()
         logger.info("Pipeline fully unloaded")

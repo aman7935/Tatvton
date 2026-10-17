@@ -36,5 +36,5 @@ def resolve_dtype(dtype: torch.dtype, device: torch.device) -> torch.dtype:
 def gpu_memory_gb() -> float:
     """Return total GPU memory in GB, or ``0.0`` if no GPU."""
     if torch.cuda.is_available():
-        return torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        return torch.cuda.get_device_properties(0).total_memory / (1024**3)
     return 0.0

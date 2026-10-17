@@ -91,10 +91,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also save the raw inpainted image (<output>_raw.png).",
     )
 
+    # -- Preview mode (CPU, no diffusion) ---------------------------------
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Fast CPU preview: SAM 2 tiny mask + ink blend, no diffusion models.",
+    )
+    parser.add_argument("--scale", type=float, default=0.8, help="Design width vs. limb width (default: 0.8).")
+    parser.add_argument("--rotation", type=float, default=0.0, help="Extra design rotation in degrees (default: 0).")
+    parser.add_argument("--opacity", type=float, default=0.9, help="Ink opacity of the placed design (default: 0.9).")
+
     # -- Config overrides --------------------------------------------------
     parser.add_argument("--resolution", type=int, help="Pipeline resolution (default: 1024).")
     parser.add_argument("--steps", type=int, help="Inference steps (default: 30).")
-    parser.add_argument("--strength", type=float, help="Inpainting strength (default: 0.85).")
+    parser.add_argument("--strength", type=float, help="AI refinement strength (default: 0.4).")
     parser.add_argument("--guidance-scale", type=float, help="Guidance scale (default: 7.5).")
     parser.add_argument("--ip-adapter-scale", type=float, help="IP-Adapter scale (default: 0.6).")
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility.")
@@ -122,7 +132,14 @@ def main(argv: list[str] | None = None) -> None:
     # -- Late imports (heavy dependencies) ---------------------------------
     from PIL import Image
 
-    from tatvton import PointPrompt, BBoxPrompt, RegionPrompt, TatVTONConfig, TatVTONPipeline
+    from tatvton import (
+        BBoxPrompt,
+        PointPrompt,
+        RegionPrompt,
+        TatVTONConfig,
+        TatVTONPipeline,
+        TatVTONPreviewPipeline,
+    )
 
     # -- Load images -------------------------------------------------------
     print(f"Loading body image:   {args.body}")
@@ -159,11 +176,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.offload is not None:
         overrides["offload_strategy"] = args.offload
 
-    config = TatVTONConfig(**overrides) if overrides else TatVTONConfig()
-
     # -- Run pipeline ------------------------------------------------------
     print("Initializing pipeline...")
-    pipeline = TatVTONPipeline(config)
+    pipeline: TatVTONPipeline | TatVTONPreviewPipeline
+    if args.preview:
+        pipeline = TatVTONPreviewPipeline()
+    else:
+        config = TatVTONConfig(**overrides) if overrides else TatVTONConfig()
+        pipeline = TatVTONPipeline(config)
 
     try:
         print("Running inference...")
@@ -171,6 +191,9 @@ def main(argv: list[str] | None = None) -> None:
             body_image=body_image,
             tattoo_image=tattoo_image,
             region=region,
+            scale=args.scale,
+            rotation=args.rotation,
+            opacity=args.opacity,
         )
 
         # -- Save outputs --------------------------------------------------
@@ -188,7 +211,8 @@ def main(argv: list[str] | None = None) -> None:
             result.raw_inpainted.save(raw_path)
             print(f"Saved raw:    {raw_path}")
 
-        print(f"Seed used: {result.seed}")
+        if not args.preview:
+            print(f"Seed used: {result.seed}")
 
     finally:
         pipeline.unload()

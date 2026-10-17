@@ -237,7 +237,7 @@ tatvton body.jpg tattoo.png --bbox 100,150,400,600 -o output.png
 
 # Multiple points + options
 tatvton body.jpg tattoo.png --point 300,400 --point 350,420 \
-    --steps 20 --strength 0.9 --seed 42 -o output.png
+    --steps 20 --strength 0.5 --seed 42 -o output.png
 
 # Save mask and raw inpainted result too
 tatvton body.jpg tattoo.png --point 300,400 --save-mask --save-raw
@@ -247,6 +247,29 @@ You can also run via module:
 
 ```bash
 python -m tatvton body.jpg tattoo.png --point 300,400
+```
+
+### CPU Preview Mode (no GPU)
+
+A fast preview that runs on CPU in seconds: SAM 2 *tiny* finds the skin
+region, then the design is aligned to the limb and multiply-blended so skin
+texture and lighting show through. No diffusion models are downloaded, and
+the design is reproduced exactly (less photorealistic than full mode).
+
+```bash
+pip install "sam-2 @ git+https://github.com/facebookresearch/sam2.git"  # SAM2_BUILD_CUDA=0 on CPU
+tatvton body.jpg tattoo.png --preview --point 300,400 --scale 0.8 --rotation 0 --opacity 0.9
+
+# Interactive app: click the skin to place the tattoo
+pip install gradio
+python examples/preview_app.py
+```
+
+```python
+from tatvton import TatVTONPreviewPipeline, PointPrompt
+
+pipe = TatVTONPreviewPipeline()
+result = pipe(body, tattoo, PointPrompt(coords=[(300, 400)]), scale=0.8)
 ```
 
 ### CLI Options
@@ -260,7 +283,7 @@ python -m tatvton body.jpg tattoo.png --point 300,400
 | `-o, --output` | Output path | `output.png` |
 | `--resolution` | Pipeline resolution | 1024 |
 | `--steps` | Inference steps | 30 |
-| `--strength` | Inpainting strength | 0.85 |
+| `--strength` | AI refinement strength (lower keeps the design more exact) | 0.4 |
 | `--guidance-scale` | Guidance scale | 7.5 |
 | `--ip-adapter-scale` | IP-Adapter scale | 0.6 |
 | `--seed` | Random seed | random |
@@ -268,6 +291,24 @@ python -m tatvton body.jpg tattoo.png --point 300,400
 | `--offload` | none / model / sequential | model |
 | `--save-mask` | Save mask image | - |
 | `--save-raw` | Save raw inpainted result | - |
+
+## Full Realistic Pipeline (GPU)
+
+`TatVTONPipeline` works as **composite, then refine**: the exact design is
+placed on the SAM 2 skin mask, then SDXL inpainting repaints only the tattoo
+area at low strength (IP-Adapter sees the design), so the ink looks settled
+into the skin without the design being redrawn. Every default model is public:
+
+| Model | Hub ID | Role |
+|-------|--------|------|
+| SAM 2 large | `facebook/sam2-hiera-large` | Skin mask |
+| SDXL inpainting | `diffusers/stable-diffusion-xl-1.0-inpainting-0.1` | Realistic refinement |
+| SDXL VAE fp16 fix | `madebyollin/sdxl-vae-fp16-fix` | Avoids black/NaN images in fp16 |
+| IP-Adapter Plus ViT-H | `h94/IP-Adapter` (`sdxl_models/`, encoder `models/image_encoder`) | Keeps the design style |
+| ControlNet (optional) | `controlnet_model_id=None` by default | Body-structure guide |
+
+Needs a GPU (~10 GB VRAM with model offload; a Colab T4 works). The easiest
+way to run it is [`notebooks/tatvton_full_pipeline_colab.ipynb`](notebooks/tatvton_full_pipeline_colab.ipynb).
 
 ## Configuration
 
