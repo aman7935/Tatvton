@@ -52,7 +52,9 @@ class TatVTONConfig:
     # -- Device / precision -----------------------------------------------
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
-    offload_strategy: Literal["none", "model", "sequential"] = "model"
+    # "auto": load straight to the GPU when it has >= 14 GB (e.g. Colab T4),
+    # otherwise offload idle models to CPU RAM ("model").
+    offload_strategy: Literal["auto", "none", "model", "sequential"] = "auto"
 
     # -- Optional features ------------------------------------------------
     use_densepose: bool = False

@@ -288,7 +288,7 @@ result = pipe(body, tattoo, PointPrompt(coords=[(300, 400)]), scale=0.8)
 | `--ip-adapter-scale` | IP-Adapter scale | 0.6 |
 | `--seed` | Random seed | random |
 | `--device` | cuda / cpu / mps | cuda |
-| `--offload` | none / model / sequential | model |
+| `--offload` | auto / none / model / sequential (auto = straight to GPU if ≥ 14 GB VRAM) | auto |
 | `--save-mask` | Save mask image | - |
 | `--save-raw` | Save raw inpainted result | - |
 
@@ -307,7 +307,7 @@ into the skin without the design being redrawn. Every default model is public:
 | IP-Adapter Plus ViT-H | `h94/IP-Adapter` (`sdxl_models/`, encoder `models/image_encoder`) | Keeps the design style |
 | ControlNet (optional) | `controlnet_model_id=None` by default | Body-structure guide |
 
-Needs a GPU (~10 GB VRAM with model offload; a Colab T4 works). The easiest
+Needs a GPU: on ≥ 14 GB VRAM (e.g. Colab T4) models load straight to the GPU, keeping system RAM free; smaller GPUs use CPU offload. The easiest
 way to run it is [`notebooks/tatvton_full_pipeline_colab.ipynb`](notebooks/tatvton_full_pipeline_colab.ipynb).
 
 ## Configuration

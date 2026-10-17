@@ -116,7 +116,7 @@ class TestBuildParser:
 
     def test_invalid_offload(self):
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["b.jpg", "t.png", "--point", "0,0", "--offload", "auto"])
+            build_parser().parse_args(["b.jpg", "t.png", "--point", "0,0", "--offload", "bogus"])
 
 
 # ── main() integration ───────────────────────────────────────────────

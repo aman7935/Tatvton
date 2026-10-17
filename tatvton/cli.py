@@ -111,8 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=["cuda", "cpu", "mps"], help="Device (default: cuda).")
     parser.add_argument(
         "--offload",
-        choices=["none", "model", "sequential"],
-        help="Offload strategy (default: model).",
+        choices=["auto", "none", "model", "sequential"],
+        help="Offload strategy (default: auto = direct GPU if >= 14 GB VRAM, else model).",
     )
 
     return parser

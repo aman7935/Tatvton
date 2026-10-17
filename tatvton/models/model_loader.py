@@ -9,9 +9,12 @@ from typing import Any
 import torch
 
 from tatvton.config import TatVTONConfig
-from tatvton.utils.device import resolve_device, resolve_dtype
+from tatvton.utils.device import gpu_memory_gb, resolve_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
+
+# Enough VRAM to keep SDXL + IP-Adapter resident without CPU offload
+_DIRECT_GPU_MIN_GB = 14.0
 
 
 class ModelLoader:
@@ -78,23 +81,29 @@ class ModelLoader:
         """
         if "pipeline" not in self._components:
             cfg = self._config
+            direct = self._loads_directly_to_gpu()
             kwargs: dict[str, Any] = {"torch_dtype": self._dtype}
             if self._dtype == torch.float16:
                 kwargs["variant"] = "fp16"
+            if direct:
+                # Weights go straight to VRAM instead of being staged in CPU RAM
+                kwargs["device_map"] = self._device.type
             if cfg.vae_model_id is not None:
                 from diffusers import AutoencoderKL
 
                 logger.info("Loading VAE from %s", cfg.vae_model_id)
-                kwargs["vae"] = AutoencoderKL.from_pretrained(
-                    cfg.vae_model_id, torch_dtype=self._dtype
-                )
+                vae = AutoencoderKL.from_pretrained(cfg.vae_model_id, torch_dtype=self._dtype)
+                kwargs["vae"] = vae.to(self._device) if direct else vae
 
             logger.info("Loading SDXL inpainting pipeline from %s", cfg.sdxl_model_id)
             if self.has_controlnet:
                 from diffusers import StableDiffusionXLControlNetInpaintPipeline
 
+                controlnet = self.load_controlnet()
                 pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
-                    cfg.sdxl_model_id, controlnet=self.load_controlnet(), **kwargs
+                    cfg.sdxl_model_id,
+                    controlnet=controlnet.to(self._device) if direct else controlnet,
+                    **kwargs,
                 )
             else:
                 from diffusers import StableDiffusionXLInpaintPipeline
@@ -117,7 +126,10 @@ class ModelLoader:
                 )
                 pipe.set_ip_adapter_scale(cfg.ip_adapter_scale)
 
-            self._apply_offload(pipe)
+            if direct:
+                logger.info("Loaded pipeline directly on %s (no CPU offload)", self._device)
+            else:
+                self._apply_offload(pipe)
             self._components["pipeline"] = pipe
 
         return self._components["pipeline"]
@@ -137,6 +149,15 @@ class ModelLoader:
         self._flush_gpu()
         logger.info("Unloaded all components: %s", names)
 
+    def _loads_directly_to_gpu(self) -> bool:
+        """Whether to load the pipeline straight onto the GPU (no CPU staging)."""
+        if self._device.type != "cuda":
+            return False
+        strategy = self._config.offload_strategy
+        if strategy == "auto":
+            return gpu_memory_gb() >= _DIRECT_GPU_MIN_GB
+        return strategy == "none"
+
     def _apply_offload(self, pipe: Any) -> None:
         """Apply the configured offload strategy to the diffusion pipeline."""
         strategy = self._config.offload_strategy
@@ -146,7 +167,7 @@ class ModelLoader:
         elif strategy == "sequential":
             pipe.enable_sequential_cpu_offload()
             logger.info("Enabled sequential CPU offload")
-        elif strategy == "model":
+        elif strategy in ("model", "auto"):
             pipe.enable_model_cpu_offload()
             logger.info("Enabled model CPU offload")
         else:
